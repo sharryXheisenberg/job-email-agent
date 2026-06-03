@@ -25,7 +25,7 @@ def _get_client() -> Groq:
 def _chat(client: Groq, system: str, user: str, max_tokens: int = 1024) -> str:
     """Single-turn Groq chat completion."""
     response = client.chat.completions.create(
-        model="llama3-8b-8192",   # free & fast
+        model="llama-3.1-8b-instant",   # free & fast
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -126,4 +126,4 @@ def generate_email_intro(jobs: list[dict]) -> str:
         return (
             f"Good morning! Here's your daily curated tech job digest with "
             f"{len(jobs)} fresh opportunities in software engineering, data analysis, "
-            "and related fields. Apply early — great roles fill fast!"
+            "and related fields. Apply early — great roles fill fast!")
