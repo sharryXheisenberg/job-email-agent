@@ -14,21 +14,25 @@ class JobScraper:
         return any(role.lower() in title.lower() for role in TARGET_ROLES)
 
     def scrape_remoteok(self):
+        logger.info("🌐 Scraping RemoteOK... (may take a few seconds)")
         try:
-            res = requests.get("https://remoteok.com/api", timeout=10)
+            res = requests.get("https://remoteok.com/api", timeout=15)
             data = res.json()
-            for j in data[1:]: # First element is often a legal notice
+            for j in data[1:]: 
                 if self.filter_job(j.get('position', '')):
                     self.jobs.append({
                         "title": j.get('position'), "company": j.get('company'),
                         "location": j.get('location', 'Remote'), "url": j.get('url'),
                         "tags": j.get('tags', ''), "source": "RemoteOK", "date": j.get('date')
                     })
-        except Exception as e: logger.error(f"RemoteOK failed: {e}")
+            logger.info("✅ RemoteOK completed.")
+        except Exception as e: 
+            logger.error(f"❌ RemoteOK failed: {e}")
 
     def scrape_remotive(self):
+        logger.info("🌐 Scraping Remotive... (may take a few seconds)")
         try:
-            res = requests.get("https://remotive.com/api/remote-jobs", timeout=10)
+            res = requests.get("https://remotive.com/api/remote-jobs", timeout=15)
             data = res.json().get('jobs', [])
             for j in data:
                 if self.filter_job(j.get('title', '')):
@@ -37,11 +41,14 @@ class JobScraper:
                         "location": "Remote", "url": j.get('url'),
                         "tags": j.get('category', ''), "source": "Remotive", "date": j.get('publication_date')
                     })
-        except Exception as e: logger.error(f"Remotive failed: {e}")
+            logger.info("✅ Remotive completed.")
+        except Exception as e: 
+            logger.error(f"❌ Remotive failed: {e}")
 
     def scrape_weworkremotely(self):
+        logger.info("🌐 Scraping WeWorkRemotely... (may take a few seconds)")
         try:
-            res = requests.get("https://weworkremotely.com/categories/remote-dev-jobs.rss", timeout=10)
+            res = requests.get("https://weworkremotely.com/categories/remote-dev-jobs.rss", timeout=15)
             soup = BeautifulSoup(res.content, "xml")
             for item in soup.find_all("item"):
                 title = item.find("title").text
@@ -51,13 +58,16 @@ class JobScraper:
                         "location": "Remote", "url": item.find("link").text,
                         "tags": "WWR", "source": "WeWorkRemotely", "date": item.find("pubDate").text
                     })
-        except Exception as e: logger.error(f"WWR failed: {e}")
+            logger.info("✅ WeWorkRemotely completed.")
+        except Exception as e: 
+            logger.error(f"❌ WWR failed: {e}")
 
     def run_all(self):
-        logger.info("Starting scraping process...")
+        logger.info("🚀 Starting full scraping process...")
         self.scrape_remoteok()
         self.scrape_remotive()
         self.scrape_weworkremotely()
+        
         # Deduplicate
         seen_urls = set()
         unique_jobs = []
@@ -65,4 +75,6 @@ class JobScraper:
             if j['url'] not in seen_urls:
                 unique_jobs.append(j)
                 seen_urls.add(j['url'])
+        
+        logger.info(f"✨ Successfully collected {len(unique_jobs)} unique jobs.")
         return unique_jobs
