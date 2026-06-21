@@ -12,35 +12,46 @@ from utils.logger import get_logger
 load_dotenv()
 logger = get_logger("Runner")
 
+
 def run_pipeline(dry_run=False):
     logger.info("Pipeline started...")
-    
+
     # 1. Scraping
     scraper = JobScraper()
     raw_jobs = scraper.run_all()
-    
-    if len(raw_jobs) < int(os.getenv("MIN_JOBS", 10)):
-        logger.warning(f"Not enough jobs found ({len(raw_jobs)}). Proceeding anyway.")
+
+    min_jobs = int(os.getenv("MIN_JOBS", 10))
+    if len(raw_jobs) < min_jobs:
+        logger.warning(f"Not enough jobs found ({len(raw_jobs)} < {min_jobs} minimum). Proceeding anyway.")
+
+    if not raw_jobs:
+        logger.error("No jobs found from any source. Aborting this run — nothing to send.")
+        return
 
     # 2. AI processing
     agent = JobAgent(os.getenv("GROQ_API_KEY"))
     ranked_jobs = agent.rank_and_summarise(raw_jobs)
     intro = agent.generate_email_intro(ranked_jobs)
-    
+
     if dry_run:
-        logger.info("DRY RUN: Printing top 3 jobs instead of sending email:")
-        for j in ranked_jobs[:3]:
-            print(f"Rank {j.get('rank', '?')}: {j.get('title', 'n/a')} - {j.get('company', 'n/a')}")
-        return
+        logger.info(f"DRY RUN: {len(ranked_jobs)} jobs collected. Printing top 5 instead of sending email:")
+        for j in ranked_jobs[:5]:
+            print(f"Rank {j.get('rank', '?')}: {j.get('title', 'n/a')} - {j.get('company', 'n/a')} "
+                  f"[{j.get('source', 'n/a')}] - {j.get('location', 'n/a')}")
         return
 
     # 3. Build Email
     html = build_html_email(ranked_jobs, intro)
     plain = build_plain_email(ranked_jobs, intro)
-    subject = f"Tech Job Digest - {datetime.now().strftime('%Y-%m-%d')} | Fresh Openings Inside"
-    
+    subject = f"Tech Job Digest (India Focus) - {datetime.now().strftime('%Y-%m-%d')} | Fresh Openings Inside"
+
     # 4. Send
-    recipients = os.getenv("RECIPIENT_EMAILS").split(",")
+    recipients_raw = os.getenv("RECIPIENT_EMAILS", "")
+    recipients = [r.strip() for r in recipients_raw.split(",") if r.strip()]
+    if not recipients:
+        logger.error("No RECIPIENT_EMAILS configured. Aborting send.")
+        return
+
     send_email(
         os.getenv("SENDER_EMAIL"),
         os.getenv("SENDER_APP_PASSWORD"),
@@ -51,14 +62,15 @@ def run_pipeline(dry_run=False):
     )
     logger.info("✅ Pipeline completed successfully.")
 
+
 def start_scheduler():
     send_time = os.getenv("SEND_TIME", "09:00")
     schedule.every().day.at(send_time).do(run_pipeline)
-    
+
     logger.info(f"Scheduler active. Jobs will be sent daily at {send_time}")
     # Run once immediately on startup
     run_pipeline()
-    
+
     while True:
         schedule.run_pending()
         time.sleep(30)
