@@ -34,7 +34,9 @@ def run_pipeline(dry_run=False):
     intro = agent.generate_email_intro(ranked_jobs)
 
     if dry_run:
-        logger.info(f"DRY RUN: {len(ranked_jobs)} jobs collected. Printing top 5 instead of sending email:")
+        pune_count = sum(1 for j in ranked_jobs if "pune" in (j.get('location', '') or "").lower())
+        logger.info(f"DRY RUN: {len(ranked_jobs)} jobs collected ({pune_count} Pune-located). "
+                    f"Printing top 5 instead of sending email:")
         for j in ranked_jobs[:5]:
             print(f"Rank {j.get('rank', '?')}: {j.get('title', 'n/a')} - {j.get('company', 'n/a')} "
                   f"[{j.get('source', 'n/a')}] - {j.get('location', 'n/a')}")
@@ -43,7 +45,7 @@ def run_pipeline(dry_run=False):
     # 3. Build Email
     html = build_html_email(ranked_jobs, intro)
     plain = build_plain_email(ranked_jobs, intro)
-    subject = f"Tech Job Digest (India Focus) - {datetime.now().strftime('%Y-%m-%d')} | Fresh Openings Inside"
+    subject = f"Tech Job Digest (Pune + India Focus) - {datetime.now().strftime('%Y-%m-%d')} | Entry-Level Openings Inside"
 
     # 4. Send
     recipients_raw = os.getenv("RECIPIENT_EMAILS", "")

@@ -25,6 +25,46 @@ INDIA_KEYWORDS = [
     "ahmedabad", "jaipur", "remote india", "in-remote"
 ]
 
+# Pune-specific keywords — used to flag/prioritize Pune jobs from any source,
+# and as the location filter for the 4 Pune-only job sites below.
+PUNE_KEYWORDS = ["pune", "pimpri", "chinchwad", "hinjewadi", "hinjawadi", "wakad", "baner", "kothrud"]
+
+# Phrases that signal an ENTRY-LEVEL role (0-2 years experience).
+# Checked against title + any short description/snippet text we get from a source.
+ENTRY_LEVEL_PATTERNS = [
+    "fresher", "freshers", "entry level", "entry-level", "0-1 year", "0-2 year",
+    "0 to 1 year", "0 to 2 year", "1-2 year", "1 to 2 year", "intern", "internship",
+    "graduate", "graduate engineer trainer", "get", "trainee", "junior",
+    "no experience", "0+ years", "1+ year", "associate engineer",
+]
+
+# Phrases that signal a SENIOR / too-experienced role — used to actively
+# EXCLUDE jobs even if they otherwise match a target role keyword, since
+# noisy aggregators (jobsavior, jobsora, apna) mix all experience levels
+# together with no structured experience field to filter on.
+SENIOR_EXCLUDE_PATTERNS = [
+    "senior", "sr.", "sr ", "lead ", "principal", "staff engineer",
+    "manager", "head of", "director", "vp ", "architect", "10+ years",
+    "8+ years", "7+ years", "6+ years", "5+ years", "4+ years", "3+ years",
+    "3-5 years", "5-8 years", "4-6 years", "minimum 5", "minimum 4", "minimum 3",
+]
+
+
+def is_entry_level(*texts):
+    """
+    Returns True if the combined text looks like an entry-level (0-2 yrs) role.
+    Conservative: if we see an explicit senior/years-heavy marker, reject.
+    If we see an explicit entry marker, accept. If neither is present, we
+    can't tell from title alone — caller decides whether to keep or drop
+    based on context (see usage below).
+    """
+    combined = " ".join(t for t in texts if t).lower()
+    if any(p in combined for p in SENIOR_EXCLUDE_PATTERNS):
+        return False
+    if any(p in combined for p in ENTRY_LEVEL_PATTERNS):
+        return True
+    return None  # unknown — title gives no signal either way
+
 # Public Greenhouse/Lever job boards for companies with a real, verified India presence.
 # These are FREE, official, public JSON APIs — no auth, no scraping fragility.
 #
@@ -72,6 +112,12 @@ class JobScraper:
         if not text:
             return False
         return any(word in text.lower() for word in INDIA_KEYWORDS)
+
+    def is_pune_job(self, text):
+        """Checks if a job description or location mentions Pune specifically."""
+        if not text:
+            return False
+        return any(word in text.lower() for word in PUNE_KEYWORDS)
 
     # ------------------------------------------------------------------
     # SOURCE 1: Greenhouse public job board API (FREE, official, stable)
@@ -368,6 +414,222 @@ class JobScraper:
         except Exception as e:
             logger.error(f"❌ WWR failed: {e}")
 
+    # ------------------------------------------------------------------
+    # SOURCE 10: JobSavior — Pune-specific listing page (best-effort HTML)
+    # No public API. Server-rendered HTML, so static scraping CAN reach
+    # it (unlike Naukri/Internshala), but markup/classes may shift over
+    # time. Multiple selector fallbacks are tried before giving up.
+    # ------------------------------------------------------------------
+    def scrape_jobsavior_pune(self):
+        logger.info("📍 Scraping JobSavior (Pune)...")
+        added = 0
+        try:
+            url = "https://in.jobsavior.com/job-offers/pune"
+            res = requests.get(url, headers=self.headers, timeout=15)
+            if res.status_code != 200:
+                logger.warning(f"   JobSavior returned HTTP {res.status_code}, skipping.")
+                return
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            cards = (soup.find_all("div", class_="job-item")
+                      or soup.find_all("article")
+                      or soup.find_all("div", class_="card"))
+
+            if not cards:
+                logger.warning("   JobSavior: no recognizable job cards found "
+                                "(site markup may have changed). 0 jobs added.")
+                return
+
+            for card in cards:
+                title_elem = card.find(["h2", "h3", "a"])
+                if not title_elem:
+                    continue
+                title = title_elem.get_text(strip=True)
+                snippet = card.get_text(" ", strip=True)
+
+                if not self.filter_job(title):
+                    continue
+                entry_check = is_entry_level(title, snippet)
+                if entry_check is False:
+                    continue  # explicitly senior — skip
+
+                link_elem = card.find("a")
+                href = link_elem.get("href", "") if link_elem else ""
+                if href and not href.startswith("http"):
+                    href = "https://in.jobsavior.com" + href
+
+                company_elem = card.find(["span", "div"], class_=lambda c: c and "company" in c.lower())
+
+                self.jobs.append({
+                    "title": title,
+                    "company": company_elem.get_text(strip=True) if company_elem else "Unknown",
+                    "location": "Pune, India",
+                    "url": href,
+                    "tags": "Pune / Entry-Level" if entry_check else "Pune",
+                    "source": "JobSavior",
+                    "date": "Recent",
+                })
+                added += 1
+            logger.info(f"✅ JobSavior completed. {added} Pune jobs added.")
+        except Exception as e:
+            logger.warning(f"   JobSavior scraping failed: {e}")
+
+    # ------------------------------------------------------------------
+    # SOURCE 11: Jobsora — Pune-specific listing page (best-effort HTML)
+    # ------------------------------------------------------------------
+    def scrape_jobsora_pune(self):
+        logger.info("📍 Scraping Jobsora (Pune)...")
+        added = 0
+        try:
+            url = "https://in.jobsora.com/jobs-pune"
+            res = requests.get(url, headers=self.headers, timeout=15)
+            if res.status_code != 200:
+                logger.warning(f"   Jobsora returned HTTP {res.status_code}, skipping.")
+                return
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            cards = (soup.find_all("div", class_="vacancy-item")
+                      or soup.find_all("article")
+                      or soup.find_all("div", class_="job-card"))
+
+            if not cards:
+                logger.warning("   Jobsora: no recognizable job cards found "
+                                "(site markup may have changed). 0 jobs added.")
+                return
+
+            for card in cards:
+                title_elem = card.find(["h2", "h3", "a"])
+                if not title_elem:
+                    continue
+                title = title_elem.get_text(strip=True)
+                snippet = card.get_text(" ", strip=True)
+
+                if not self.filter_job(title):
+                    continue
+                entry_check = is_entry_level(title, snippet)
+                if entry_check is False:
+                    continue
+
+                link_elem = card.find("a")
+                href = link_elem.get("href", "") if link_elem else ""
+                if href and not href.startswith("http"):
+                    href = "https://in.jobsora.com" + href
+
+                company_elem = card.find(["span", "div"], class_=lambda c: c and "company" in c.lower())
+
+                self.jobs.append({
+                    "title": title,
+                    "company": company_elem.get_text(strip=True) if company_elem else "Unknown",
+                    "location": "Pune, India",
+                    "url": href,
+                    "tags": "Pune / Entry-Level" if entry_check else "Pune",
+                    "source": "Jobsora",
+                    "date": "Recent",
+                })
+                added += 1
+            logger.info(f"✅ Jobsora completed. {added} Pune jobs added.")
+        except Exception as e:
+            logger.warning(f"   Jobsora scraping failed: {e}")
+
+    # ------------------------------------------------------------------
+    # SOURCE 12: Naukri Fresher Jobs in Pune (BEST-EFFORT — no public API)
+    # Naukri renders job listings via client-side JavaScript, so a plain
+    # HTTP GET will not contain the job cards in most cases. This is kept
+    # as a best-effort source consistent with scrape_naukri() above: if
+    # it returns 0, that is expected, not a bug.
+    # ------------------------------------------------------------------
+    def scrape_naukri_fresher_pune(self):
+        logger.info("📍 Scraping Naukri Fresher Jobs (Pune, best-effort)...")
+        added = 0
+        try:
+            url = "https://www.naukri.com/fresher-jobs-in-pune"
+            res = requests.get(url, headers=self.headers, timeout=15)
+            if res.status_code != 200:
+                logger.warning(f"   Naukri fresher-Pune returned HTTP {res.status_code} (likely blocked). Skipping.")
+                return
+            soup = BeautifulSoup(res.text, "html.parser")
+            cards = soup.find_all("article", class_="jobTuple") or soup.find_all("div", class_="srp-jobtuple-wrapper")
+
+            if not cards:
+                logger.warning("   Naukri fresher-Pune: no job cards found in static HTML "
+                                "(page renders via JavaScript — static scraping can't reach it, as expected).")
+                return
+
+            for card in cards:
+                title_elem = card.find("a", class_="title")
+                company_elem = card.find("a", class_="comp-name")
+                if not title_elem:
+                    continue
+                title = title_elem.text.strip()
+                if not self.filter_job(title):
+                    continue
+                self.jobs.append({
+                    "title": title,
+                    "company": company_elem.text.strip() if company_elem else "Unknown",
+                    "location": "Pune, India",
+                    "url": title_elem.get("href", ""),
+                    "tags": "Pune / Fresher",
+                    "source": "Naukri-Fresher-Pune",
+                    "date": "Recent",
+                })
+                added += 1
+            logger.info(f"✅ Naukri fresher-Pune completed. {added} jobs added.")
+        except Exception as e:
+            logger.warning(f"   Naukri fresher-Pune scraping failed: {e}")
+
+    # ------------------------------------------------------------------
+    # SOURCE 13: Apna.co — Pune listing page (best-effort HTML)
+    # Apna is server-rendered (confirmed reachable) but is a general
+    # blue-collar + white-collar jobs board, so the role filter does
+    # most of the work here to surface only SDE/data/analyst postings.
+    # ------------------------------------------------------------------
+    def scrape_apna_pune(self):
+        logger.info("📍 Scraping Apna.co (Pune)...")
+        added = 0
+        try:
+            url = "https://apna.co/jobs/jobs-in-pune"
+            res = requests.get(url, headers=self.headers, timeout=15)
+            if res.status_code != 200:
+                logger.warning(f"   Apna.co returned HTTP {res.status_code}, skipping.")
+                return
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            # Apna job cards are typically anchor tags linking to /job/pune/<slug>-<id>
+            links = soup.find_all("a", href=lambda h: h and "/job/pune/" in h)
+
+            if not links:
+                logger.warning("   Apna.co: no job links found "
+                                "(site markup may have changed). 0 jobs added.")
+                return
+
+            for link in links:
+                title = link.get_text(" ", strip=True)
+                if not title:
+                    continue
+                if not self.filter_job(title):
+                    continue
+                entry_check = is_entry_level(title)
+                if entry_check is False:
+                    continue
+
+                href = link.get("href", "")
+                if href and not href.startswith("http"):
+                    href = "https://apna.co" + href
+
+                self.jobs.append({
+                    "title": title,
+                    "company": "See listing",
+                    "location": "Pune, India",
+                    "url": href,
+                    "tags": "Pune / Entry-Level" if entry_check else "Pune",
+                    "source": "Apna",
+                    "date": "Recent",
+                })
+                added += 1
+            logger.info(f"✅ Apna.co completed. {added} Pune jobs added.")
+        except Exception as e:
+            logger.warning(f"   Apna.co scraping failed: {e}")
+
     def run_all(self):
         logger.info("🚀 Starting India-Focused scraping process...")
 
@@ -377,6 +639,12 @@ class JobScraper:
         self.scrape_internshala()
         self.scrape_naukri()
 
+        # Pune-specific sources (new)
+        self.scrape_jobsavior_pune()
+        self.scrape_jobsora_pune()
+        self.scrape_naukri_fresher_pune()
+        self.scrape_apna_pune()
+
         # Global boards, hard-filtered for India relevance
         self.scrape_remoteok()
         self.scrape_remotive()
@@ -384,16 +652,66 @@ class JobScraper:
         self.scrape_arbeitnow()
         self.scrape_weworkremotely()
 
-        # Deduplicate by URL
+        # ------------------------------------------------------------
+        # ENTRY-LEVEL FILTER (0-2 years experience) — applied globally
+        # across every source, not just the Pune-specific ones. We only
+        # DROP a job when the title/snippet explicitly signals senior
+        # experience (e.g. "Senior", "5+ years", "Lead"). Jobs with no
+        # explicit experience signal either way are KEPT, since most
+        # genuine SDE-I / Analyst / Intern postings don't always spell
+        # out "0-2 years" in the title — being strict in the other
+        # direction would wipe out most of the real entry-level supply.
+        # ------------------------------------------------------------
+        filtered_jobs = []
+        senior_dropped = 0
+        for j in self.jobs:
+            check = is_entry_level(j.get('title', ''), j.get('tags', ''))
+            if check is False:
+                senior_dropped += 1
+                continue
+            filtered_jobs.append(j)
+        logger.info(f"   🎯 Entry-level filter: dropped {senior_dropped} senior/experienced postings, "
+                    f"kept {len(filtered_jobs)} entry-level or unspecified-experience jobs.")
+        self.jobs = filtered_jobs
+
+        # ------------------------------------------------------------
+        # DEDUPLICATION — strengthened.
+        # Primary key: URL (most reliable when present and not a generic
+        # listing-page URL). Fallback key: normalized (title + company),
+        # because some scraped sources (e.g. WeWorkRemotely "Various",
+        # or a card with no href) can produce blank/duplicate URLs while
+        # still being genuinely different postings, or genuinely the same
+        # posting mirrored across two sources. Both keys must be unseen
+        # for a job to be kept.
+        # ------------------------------------------------------------
         seen_urls = set()
+        seen_title_company = set()
         unique_jobs = []
         for j in self.jobs:
-            url = j.get('url', '')
-            if url and url not in seen_urls:
-                unique_jobs.append(j)
+            url = (j.get('url') or '').strip().rstrip('/')
+            title_key = (j.get('title') or '').strip().lower()
+            company_key = (j.get('company') or '').strip().lower()
+            combo_key = f"{title_key}::{company_key}"
+
+            if url:
+                if url in seen_urls:
+                    continue
                 seen_urls.add(url)
+            # Even with a unique/blank URL, also guard against the same
+            # title+company appearing twice across different sources.
+            if combo_key in seen_title_company and title_key and company_key:
+                continue
+            seen_title_company.add(combo_key)
+            unique_jobs.append(j)
+
+        # Surface Pune jobs first, since that's this run's priority,
+        # without dropping non-Pune jobs from the digest.
+        unique_jobs.sort(key=lambda j: 0 if self.is_pune_job(j.get('location', '')) else 1)
 
         logger.info(f"✨ Successfully collected {len(unique_jobs)} unique jobs.")
+
+        pune_count = sum(1 for j in unique_jobs if self.is_pune_job(j.get('location', '')))
+        logger.info(f"   📍 Of which Pune-located: {pune_count}")
 
         # Source breakdown for visibility
         from collections import Counter
