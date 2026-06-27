@@ -1,41 +1,41 @@
-"""
-utils/logger.py
----------------
-Centralised logging: prints to console + writes to logs/agent.log
-"""
-
 import logging
 import os
-from datetime import datetime
-
-LOG_DIR  = os.path.join(os.path.dirname(__file__), "..", "logs")
-LOG_FILE = os.path.join(LOG_DIR, "agent.log")
+import sys
+import io
 
 
-def get_logger(name: str) -> logging.Logger:
-    os.makedirs(LOG_DIR, exist_ok=True)
+def _make_utf8_console_handler(level=logging.INFO):
+    """Create a StreamHandler that writes UTF-8 (replace errors) to the console.
 
+    Falls back to the default StreamHandler if stdout.buffer is unavailable.
+    """
+    try:
+        buf = sys.stdout.buffer
+        stream = io.TextIOWrapper(buf, encoding="utf-8", errors="replace", line_buffering=True)
+        handler = logging.StreamHandler(stream)
+    except Exception:
+        handler = logging.StreamHandler()
+    handler.setLevel(level)
+    return handler
+
+
+def get_logger(name):
     logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger  # already configured
+    if not logger.handlers:
+        logger.setLevel(logging.DEBUG)
 
-    logger.setLevel(logging.DEBUG)
+        # File Handler (explicit UTF-8)
+        os.makedirs('logs', exist_ok=True)
+        fh = logging.FileHandler('logs/agent.log', encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
 
-    fmt = logging.Formatter(
-        "[%(asctime)s] %(levelname)-8s  %(name)s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+        # Console Handler (UTF-8 safe)
+        ch = _make_utf8_console_handler(logging.INFO)
 
-    # Console handler
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        fh.setFormatter(formatter)
+        ch.setFormatter(formatter)
 
-    # File handler
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
+        logger.addHandler(fh)
+        logger.addHandler(ch)
     return logger

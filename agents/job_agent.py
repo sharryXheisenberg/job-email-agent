@@ -1,129 +1,90 @@
-"""
-agents/job_agent.py
--------------------
-Uses Groq (free LLM API) to:
-  1. Score & rank the scraped jobs
-  2. Write a catchy, personalised email digest intro
-  3. Generate a short summary blurb for each job
-"""
-
-import os
 import json
 from groq import Groq
 from utils.logger import get_logger
 
-logger = get_logger("JobAgent")
+logger = get_logger("AIAgent")
 
 
-def _get_client() -> Groq:
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise EnvironmentError("GROQ_API_KEY not set in .env")
-    return Groq(api_key=api_key)
+class JobAgent:
+    def __init__(self, api_key):
+        self.client = Groq(api_key=api_key)
+        # THIS MUST BE llama-3.1-8b-instant
+        self.model = "llama-3.1-8b-instant"
 
+    def rank_and_summarise(self, jobs):
+        if not jobs:
+            return []
 
-def _chat(client: Groq, system: str, user: str, max_tokens: int = 1024) -> str:
-    """Single-turn Groq chat completion."""
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",   # free & fast
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        max_tokens=max_tokens,
-        temperature=0.7,
-    )
-    return response.choices[0].message.content.strip()
+        # Prepare compact list for prompt
+        compact_jobs = [
+            {"idx": i, "t": j.get('title', ''), "c": j.get('company', ''),
+             "loc": j.get('location', ''), "tags": j.get('tags', '')}
+            for i, j in enumerate(jobs)
+        ]
 
+        prompt = (
+            "Rank these jobs for a fresh grad / entry-level (0-2 years experience) "
+            "Software Engineer or Data Analyst based in India. "
+            "PRIORITIZE in this order: "
+            "1) Jobs located in Pune (loc field contains 'Pune'), "
+            "2) other India-based roles, "
+            "3) India-eligible remote roles. "
+            "Return ONLY a JSON object with a key 'jobs' containing an array of objects. "
+            "Each object must have 'idx' (int), 'rank' (int), and 'summary' (string, max 15 words). "
+            f"\n\nJobs: {json.dumps(compact_jobs)}"
+        )
 
-def rank_and_summarise(jobs: list[dict]) -> list[dict]:
-    """
-    Ask Groq to rank jobs by desirability for a fresh software/data grad
-    and add a one-line AI summary to each.
-    Returns sorted list (best first).
-    """
-    if not jobs:
-        return jobs
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            results = json.loads(completion.choices[0].message.content)
+            rank_list = results.get('jobs', []) if isinstance(results, dict) else []
 
-    client = _get_client()
+            # Build a lookup by idx instead of jobs.index(job), which breaks
+            # silently when two jobs are equal/duplicate dicts.
+            rank_map = {item.get('idx'): item for item in rank_list if 'idx' in item}
 
-    # Build compact job list for the prompt
-    compact = []
-    for i, j in enumerate(jobs):
-        compact.append({
-            "idx": i,
-            "title": j.get("title", ""),
-            "company": j.get("company", ""),
-            "location": j.get("location", ""),
-            "tags": j.get("tags", ""),
-            "source": j.get("source", ""),
-        })
+            for i, job in enumerate(jobs):
+                match = rank_map.get(i, {})
+                job['rank'] = match.get('rank', 99)
+                job['ai_summary'] = match.get('summary', "Interesting tech role.")
 
-    prompt_jobs = json.dumps(compact, indent=2)
+            # Deterministic safety net: Pune-located jobs always surface first,
+            # with the AI's rank only used as a tiebreaker within each group.
+            # This guarantees the Pune-priority requirement holds even if the
+            # AI doesn't follow the prompt instruction exactly.
+            def sort_key(j):
+                is_pune = 0 if "pune" in (j.get('location', '') or "").lower() else 1
+                return (is_pune, j.get('rank', 99))
 
-    system = (
-        "You are a career advisor specialising in tech roles. "
-        "You help students and early-career professionals find the best opportunities."
-    )
+            return sorted(jobs, key=sort_key)
+        except Exception as e:
+            logger.error(f"AI Ranking failed: {e}")
+            # Fallback: if AI fails, return original jobs with rank 99,
+            # still respecting Pune-first ordering.
+            for j in jobs:
+                j['rank'] = 99
+                j['ai_summary'] = "AI summary unavailable."
+            return sorted(jobs, key=lambda j: 0 if "pune" in (j.get('location', '') or "").lower() else 1)
 
-    rank_prompt = (
-        f"Here are {len(compact)} job listings:\n{prompt_jobs}\n\n"
-        "Task:\n"
-        "1. Rank ALL of them from most to least attractive for a fresh graduate or intern "
-        "   targeting software engineering, SDE, data analyst, or analyst roles.\n"
-        "2. For each job write a ONE-sentence (max 20 words) compelling summary.\n"
-        "Return ONLY a JSON array like:\n"
-        '[\n  {"idx": 0, "rank": 1, "summary": "..."}, ...\n]\n'
-        "No markdown fences, no extra text."
-    )
-
-    try:
-        raw = _chat(client, system, rank_prompt, max_tokens=2000)
-        # Strip any accidental markdown fences
-        raw = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
-        ranked = json.loads(raw)
-        # Build lookup
-        rank_map = {item["idx"]: item for item in ranked}
-        # Annotate original jobs
-        for i, job in enumerate(jobs):
-            meta = rank_map.get(i, {})
-            job["rank"] = meta.get("rank", 99)
-            job["ai_summary"] = meta.get("summary", "")
-        jobs.sort(key=lambda x: x.get("rank", 99))
-        logger.info("Jobs ranked and summarised by Groq AI")
-    except Exception as e:
-        logger.error(f"Groq ranking failed: {e}. Using original order.")
-        for i, job in enumerate(jobs):
-            job["rank"] = i + 1
-            job["ai_summary"] = ""
-
-    return jobs
-
-
-def generate_email_intro(jobs: list[dict]) -> str:
-    """
-    Ask Groq to write an engaging 2-3 sentence intro paragraph for the digest email.
-    """
-    client = _get_client()
-
-    titles = [j.get("title", "") for j in jobs[:5]]
-    companies = [j.get("company", "") for j in jobs[:5]]
-
-    system = "You write crisp, motivational career newsletter content."
-    prompt = (
-        f"Write a short, energetic 2-3 sentence intro for a daily job digest email. "
-        f"Today's digest has {len(jobs)} curated tech job openings. "
-        f"Top roles include: {', '.join(titles[:5])} at companies like {', '.join(companies[:5])}. "
-        "Sound helpful and encouraging. Do NOT use emojis in excess. Plain text only."
-    )
-
-    try:
-        intro = _chat(client, system, prompt, max_tokens=200)
-        logger.info("Email intro generated by Groq AI")
-        return intro
-    except Exception as e:
-        logger.error(f"Intro generation failed: {e}")
-        return (
-            f"Good morning! Here's your daily curated tech job digest with "
-            f"{len(jobs)} fresh opportunities in software engineering, data analysis, "
-            "and related fields. Apply early — great roles fill fast!")
+    def generate_email_intro(self, jobs):
+        if not jobs:
+            return "No new job openings were found today. Check back tomorrow!"
+        try:
+            top_jobs = [f"{j.get('title','')} at {j.get('company','')}" for j in jobs[:3]]
+            prompt = (
+                f"Write a 2-sentence energetic intro for a job digest email for an India-based "
+                f"fresher/entry-level (0-2 years experience) job seeker focused on Pune openings, "
+                f"featuring these roles: {', '.join(top_jobs)}. No emojis."
+            )
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            logger.error(f"AI Intro generation failed: {e}")
+            return "Here are the best tech job openings found for you today!"

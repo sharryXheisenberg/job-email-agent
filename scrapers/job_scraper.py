@@ -1,263 +1,782 @@
-"""
-scrapers/job_scraper.py
------------------------
-Scrapes job listings from multiple free job boards:
-  - RemoteOK
-  - GitHub Jobs (via Awesome Remote Job style listings)
-  - Remotive.io
-  - We Work Remotely
-  - HackerNews "Who is Hiring" (monthly thread)
-"""
-
+import re
 import requests
-import json
-import time
-import random
 from bs4 import BeautifulSoup
 from utils.logger import get_logger
 
-logger = get_logger("JobScraper")
+logger = get_logger("Scraper")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-}
-
+# Expanded keywords for SDE and Data roles.
+# Includes both "Developer" and "Engineer" variants since boards use them
+# interchangeably (e.g. WeWorkRemotely posts "Backend Engineer", not "Backend Developer").
 TARGET_ROLES = [
-    "software engineer", "software developer", "sde", "sde intern",
-    "data analyst", "analyst", "backend", "frontend", "full stack",
-    "python developer", "java developer", "web developer"
+    "software engineer", "software developer", "sde", "sde i", "sde ii",
+    "data analyst", "data engineer", "data scientist",
+    "business analyst", "systems analyst", "technical analyst",
+    "backend developer", "backend engineer", "frontend developer", "frontend engineer",
+    "full stack", "fullstack",
+    "python developer", "python engineer", "java developer", "java engineer",
+    "c++ developer", "node developer", "react developer",
+    "machine learning", "ml engineer", "devops engineer",
+    "qa engineer", "test engineer", "sde intern", "software intern",
+    "engineering intern", "software engineering intern",
+]
+
+INDIA_KEYWORDS = [
+    "india", "bangalore", "bengaluru", "hyderabad", "pune", "mumbai",
+    "delhi", "noida", "gurgaon", "gurugram", "chennai", "kolkata",
+    "ahmedabad", "jaipur", "remote india", "in-remote"
+]
+
+# Pune-specific keywords — used to flag/prioritize Pune jobs from any source,
+# and as the location filter for the 4 Pune-only job sites below.
+PUNE_KEYWORDS = ["pune", "pimpri", "chinchwad", "hinjewadi", "hinjawadi", "wakad", "baner", "kothrud"]
+
+# Phrases that signal an ENTRY-LEVEL role (0-2 years experience).
+# Checked against title + any short description/snippet text we get from a source.
+ENTRY_LEVEL_PATTERNS = [
+    "fresher", "freshers", "entry level", "entry-level", "0-1 year", "0-2 year",
+    "0 to 1 year", "0 to 2 year", "1-2 year", "1 to 2 year", "intern", "internship",
+    "graduate", "graduate engineer trainer", "get", "trainee", "junior",
+    "no experience", "0+ years", "1+ year", "associate engineer",
+]
+
+# Phrases that signal a SENIOR / too-experienced role — used to actively
+# EXCLUDE jobs even if they otherwise match a target role keyword, since
+# noisy aggregators (jobsavior, jobsora, apna) mix all experience levels
+# together with no structured experience field to filter on.
+SENIOR_EXCLUDE_PATTERNS = [
+    "senior", "sr.", "sr ", "lead ", "principal", "staff engineer",
+    "manager", "head of", "director", "vp ", "architect", "10+ years",
+    "8+ years", "7+ years", "6+ years", "5+ years", "4+ years", "3+ years",
+    "3-5 years", "5-8 years", "4-6 years", "minimum 5", "minimum 4", "minimum 3",
 ]
 
 
-def _is_relevant(title: str) -> bool:
-    title_lower = title.lower()
-    return any(role in title_lower for role in TARGET_ROLES)
+def is_entry_level(*texts):
+    """
+    Returns True if the combined text looks like an entry-level (0-2 yrs) role.
+    Conservative: if we see an explicit senior/years-heavy marker, reject.
+    If we see an explicit entry marker, accept. If neither is present, we
+    can't tell from title alone — caller decides whether to keep or drop
+    based on context (see usage below).
+    """
+    combined = " ".join(t for t in texts if t).lower()
+    if any(p in combined for p in SENIOR_EXCLUDE_PATTERNS):
+        return False
+    if any(p in combined for p in ENTRY_LEVEL_PATTERNS):
+        return True
+    return None  # unknown — title gives no signal either way
+
+# Public Greenhouse/Lever job boards for companies with a real, verified India presence.
+# These are FREE, official, public JSON APIs — no auth, no scraping fragility.
+#
+# IMPORTANT: The correct Greenhouse API host is "boards-api.greenhouse.io"
+# (NOT "api.greenhouse.io" — that host doesn't serve this API and 404s every time).
+#
+# Board slugs are case-sensitive and must match the company's actual ATS board
+# token, which is the path segment in their public job board URL:
+#   https://boards.greenhouse.io/<token>  ->  token is the slug below
+# Slugs below were verified live (June 2026) to have active India-based postings.
+GREENHOUSE_BOARDS = [
+    "thoughtworks",     # Bangalore + many India offices, huge SDE volume
+    "twilio",           # Bengaluru office, SDE/data roles
+    "truecaller",       # Bangalore, Mumbai, Gurgaon offices
+    "payoneer",         # Bangalore, Gurugram offices
+    "circleslife",      # Bangalore office
+    "productiv",        # Bangalore office
+    "purestorage",      # Bangalore office
+    "memryx",           # Bangalore office
+]
+
+LEVER_BOARDS = [
+    "meesho",       # India e-commerce giant, very high SDE/data hiring volume
+    "fampay",       # Bengaluru fintech, SDE roles
+    "stable-money1",  # Bengaluru fintech, SDE roles
+]
 
 
-def _safe_get(url: str, timeout: int = 10, retries: int = 2) -> requests.Response | None:
-    for attempt in range(retries):
-        try:
-            time.sleep(random.uniform(0.5, 1.5))
-            resp = requests.get(url, headers=HEADERS, timeout=timeout)
-            resp.raise_for_status()
-            return resp
-        except Exception as e:
-            logger.warning(f"Attempt {attempt+1} failed for {url}: {e}")
-    return None
+class JobScraper:
+    def __init__(self):
+        self.jobs = []
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "application/json, text/html, */*",
+        }
 
+    def filter_job(self, title):
+        """
+        Returns True if the title matches a target tech role.
+        Uses WORD-BOUNDARY matching (regex \\b), not plain substring matching.
+        Plain substring matching previously caused false positives like
+        "intern" matching inside "INTERNational Voice Process" or
+        "analyst" being too generic on its own — both surfaced completely
+        unrelated BPO/voice-process jobs as if they were tech roles.
+        """
+        if not title:
+            return False
+        title_lower = title.lower()
+        for role in TARGET_ROLES:
+            pattern = r'\b' + re.escape(role.lower()) + r'\b'
+            if re.search(pattern, title_lower):
+                return True
+        return False
 
-# ── Source 1: RemoteOK JSON API ──────────────────────────────────────────────
-def scrape_remoteok() -> list[dict]:
-    jobs = []
-    try:
-        resp = _safe_get("https://remoteok.com/api")
-        if not resp:
-            return jobs
-        data = resp.json()
-        # First item is a legal notice, skip it
-        for item in data[1:]:
-            title = item.get("position", "")
-            if not _is_relevant(title):
-                continue
-            jobs.append({
-                "title": title,
-                "company": item.get("company", "Unknown"),
-                "location": item.get("location", "Remote"),
-                "url": item.get("url", f"https://remoteok.com/jobs/{item.get('id','')}"),
-                "tags": ", ".join(item.get("tags", [])[:5]),
-                "source": "RemoteOK",
-                "date": item.get("date", "")[:10] if item.get("date") else "",
-            })
-            if len(jobs) >= 15:
-                break
-    except Exception as e:
-        logger.error(f"RemoteOK scrape failed: {e}")
-    logger.info(f"RemoteOK: {len(jobs)} jobs")
-    return jobs
+    def is_india_job(self, text):
+        """Checks if a job description or location mentions India."""
+        if not text:
+            return False
+        return any(word in text.lower() for word in INDIA_KEYWORDS)
 
+    def is_pune_job(self, text):
+        """Checks if a job description or location mentions Pune specifically."""
+        if not text:
+            return False
+        return any(word in text.lower() for word in PUNE_KEYWORDS)
 
-# ── Source 2: Remotive.io API ────────────────────────────────────────────────
-def scrape_remotive() -> list[dict]:
-    jobs = []
-    search_terms = ["software-engineer", "developer", "data-analyst"]
-    try:
-        for term in search_terms:
-            url = f"https://remotive.com/api/remote-jobs?search={term}&limit=20"
-            resp = _safe_get(url)
-            if not resp:
-                continue
-            data = resp.json()
-            for item in data.get("jobs", []):
-                title = item.get("title", "")
-                if not _is_relevant(title):
+    # ------------------------------------------------------------------
+    # SOURCE 1: Greenhouse public job board API (FREE, official, stable)
+    # ------------------------------------------------------------------
+    def scrape_greenhouse(self):
+        logger.info("🇮🇳 Scraping Greenhouse boards (India tech companies)...")
+        added = 0
+        for board in GREENHOUSE_BOARDS:
+            try:
+                url = f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs?content=true"
+                res = requests.get(url, headers=self.headers, timeout=15)
+                if res.status_code != 200:
+                    logger.warning(f"   Greenhouse board '{board}' returned HTTP {res.status_code}, skipping.")
                     continue
-                jobs.append({
+                data = res.json()
+                all_jobs = data.get("jobs", [])
+                board_added = 0
+                for j in all_jobs:
+                    title = j.get("title", "")
+                    location = (j.get("location") or {}).get("name", "")
+                    if not self.filter_job(title):
+                        continue
+                    if not self.is_india_job(location):
+                        continue
+                    self.jobs.append({
+                        "title": title,
+                        "company": board.capitalize(),
+                        "location": location or "India",
+                        "url": j.get("absolute_url", ""),
+                        "tags": "Greenhouse ATS",
+                        "source": "Greenhouse",
+                        "date": j.get("updated_at", "")[:10] if j.get("updated_at") else "Recent",
+                    })
+                    added += 1
+                    board_added += 1
+                logger.info(f"   ✓ Greenhouse '{board}': {len(all_jobs)} total postings, {board_added} matched filters.")
+            except Exception as e:
+                logger.warning(f"   Greenhouse board '{board}' failed: {e}")
+        logger.info(f"✅ Greenhouse completed. {added} India jobs added.")
+
+    # ------------------------------------------------------------------
+    # SOURCE 2: Lever public job board API (FREE, official, stable)
+    # ------------------------------------------------------------------
+    def scrape_lever(self):
+        logger.info("🇮🇳 Scraping Lever boards (India tech companies)...")
+        added = 0
+        for board in LEVER_BOARDS:
+            try:
+                url = f"https://api.lever.co/v0/postings/{board}?mode=json"
+                res = requests.get(url, headers=self.headers, timeout=15)
+                if res.status_code != 200:
+                    logger.warning(f"   Lever board '{board}' returned HTTP {res.status_code}, skipping.")
+                    continue
+                data = res.json()
+                board_added = 0
+                for j in data:
+                    title = j.get("text", "")
+                    location = (j.get("categories") or {}).get("location", "")
+                    if not self.filter_job(title):
+                        continue
+                    if not self.is_india_job(location):
+                        continue
+                    self.jobs.append({
+                        "title": title,
+                        "company": board,
+                        "location": location or "India",
+                        "url": j.get("hostedUrl", ""),
+                        "tags": "Lever ATS",
+                        "source": "Lever",
+                        "date": "Recent",
+                    })
+                    added += 1
+                    board_added += 1
+                logger.info(f"   ✓ Lever '{board}': {len(data)} total postings, {board_added} matched filters.")
+            except Exception as e:
+                logger.warning(f"   Lever board '{board}' failed: {e}")
+        logger.info(f"✅ Lever completed. {added} India jobs added.")
+
+    # ------------------------------------------------------------------
+    # SOURCE 3: Naukri.com (BEST-EFFORT — no public API, HTML scrape)
+    # Naukri renders listings client-side via JS in many cases and
+    # actively rate-limits/blocks non-browser traffic. This is kept as
+    # a best-effort source: if it returns 0, that's expected sometimes,
+    # not a bug. It will never crash the pipeline.
+    # ------------------------------------------------------------------
+    def scrape_naukri(self):
+        logger.info("🇮🇳 Scraping Naukri (best-effort, may yield 0 results)...")
+        added = 0
+        try:
+            searches = ["software-engineer-jobs", "data-analyst-jobs", "sde-jobs"]
+            for slug in searches:
+                url = f"https://www.naukri.com/{slug}"
+                res = requests.get(url, headers=self.headers, timeout=15)
+                if res.status_code != 200:
+                    logger.warning(f"   Naukri '{slug}' returned HTTP {res.status_code} (likely blocked). Skipping.")
+                    continue
+                soup = BeautifulSoup(res.text, "html.parser")
+                # Naukri's job cards live under article tags with class 'jobTuple' (subject to change)
+                cards = soup.find_all("article", class_="jobTuple") or soup.find_all("div", class_="srp-jobtuple-wrapper")
+                if not cards:
+                    logger.warning(f"   Naukri '{slug}': no job cards found in HTML "
+                                    "(page likely renders via JavaScript — static scraping can't reach it).")
+                    continue
+                for card in cards:
+                    title_elem = card.find("a", class_="title")
+                    company_elem = card.find("a", class_="comp-name")
+                    if not title_elem:
+                        continue
+                    title = title_elem.text.strip()
+                    if not self.filter_job(title):
+                        continue
+                    self.jobs.append({
+                        "title": title,
+                        "company": company_elem.text.strip() if company_elem else "Unknown",
+                        "location": "India",
+                        "url": title_elem.get("href", ""),
+                        "tags": "Naukri",
+                        "source": "Naukri",
+                        "date": "Recent",
+                    })
+                    added += 1
+        except Exception as e:
+            logger.warning(f"   Naukri scraping failed entirely: {e}")
+        logger.info(f"✅ Naukri completed. {added} jobs added (best-effort source).")
+
+    # ------------------------------------------------------------------
+    # SOURCE 4: Internshala — FIXED with honest failure reporting.
+    # Internshala returns HTTP 403 to non-browser requests (confirmed).
+    # This is kept so the door is open if Internshala relaxes blocking,
+    # or if you plug in a paid scraping proxy later.
+    # ------------------------------------------------------------------
+    def scrape_internshala(self):
+        logger.info("🇮🇳 Scraping Internshala (India Specific)...")
+        added = 0
+        try:
+            categories = ["software-engineering", "data-science"]
+            for cat in categories:
+                url = f"https://internshala.com/jobs/{cat}"
+                res = requests.get(url, headers=self.headers, timeout=15)
+                if res.status_code == 403:
+                    logger.warning(
+                        f"   Internshala blocked the request (HTTP 403) for '{cat}'. "
+                        "Internshala actively blocks scrapers — this is expected, not a bug. "
+                        "No free public API exists for Internshala."
+                    )
+                    continue
+                if res.status_code != 200:
+                    logger.warning(f"   Internshala '{cat}' returned HTTP {res.status_code}, skipping.")
+                    continue
+
+                soup = BeautifulSoup(res.text, "html.parser")
+                job_cards = soup.find_all("div", class_="individual_internship") \
+                    or soup.find_all("div", class_="job-card-container") \
+                    or soup.find_all("div", class_="container-fluid")
+
+                if not job_cards:
+                    logger.warning(f"   Internshala '{cat}': page loaded but no recognizable job cards "
+                                    "(site markup may have changed).")
+                    continue
+
+                for card in job_cards:
+                    title_elem = card.find("h3") or card.find("h4")
+                    link_elem = card.find("a")
+                    company_elem = card.find("p", class_="company-name") or card.find("div", class_="company-name")
+
+                    if title_elem and link_elem:
+                        title = title_elem.text.strip()
+                        if self.filter_job(title):
+                            href = link_elem.get("href", "")
+                            self.jobs.append({
+                                "title": title,
+                                "company": company_elem.text.strip() if company_elem else "Company Name Not Found",
+                                "location": "India",
+                                "url": href if href.startswith("http") else f"https://internshala.com{href}",
+                                "tags": "India / Entry-Level",
+                                "source": "Internshala",
+                                "date": "Recent",
+                            })
+                            added += 1
+            logger.info(f"✅ Internshala completed. {added} jobs added.")
+        except Exception as e:
+            logger.error(f"❌ Internshala failed: {e}")
+
+    # ------------------------------------------------------------------
+    # SOURCE 5-9: Global boards, hard-filtered for India relevance
+    # ------------------------------------------------------------------
+    def scrape_remoteok(self):
+        logger.info("🌐 Scraping RemoteOK (Filtering for India)...")
+        added = 0
+        try:
+            res = requests.get("https://remoteok.com/api", headers=self.headers, timeout=15)
+            data = res.json()
+            for j in data[1:]:
+                if self.filter_job(j.get('position', '')):
+                    loc = j.get('location', '') or ""
+                    tags = j.get('tags', [])
+                    tags_str = ", ".join(tags) if isinstance(tags, list) else str(tags)
+                    # RemoteOK convention: an EMPTY location field means "open to anywhere"
+                    # (not "exclude this job") — only explicit non-India regions should be excluded.
+                    is_open_remote = (not loc.strip()) or "worldwide" in loc.lower() or "anywhere" in loc.lower()
+                    if self.is_india_job(loc) or is_open_remote:
+                        self.jobs.append({
+                            "title": j.get('position'), "company": j.get('company'),
+                            "location": loc or "Worldwide Remote", "url": j.get('url'),
+                            "tags": tags_str, "source": "RemoteOK", "date": j.get('date')
+                        })
+                        added += 1
+            logger.info(f"✅ RemoteOK completed. {added} jobs added.")
+        except Exception as e:
+            logger.error(f"❌ RemoteOK failed: {e}")
+
+    def scrape_remotive(self):
+        logger.info("🌐 Scraping Remotive (Filtering for India)...")
+        added = 0
+        try:
+            res = requests.get("https://remotive.com/api/remote-jobs", headers=self.headers, timeout=15)
+            data = res.json().get('jobs', [])
+            for j in data:
+                if self.filter_job(j.get('title', '')):
+                    loc = j.get('candidate_required_location', '')
+                    if self.is_india_job(loc) or "worldwide" in loc.lower() or "anywhere" in loc.lower():
+                        self.jobs.append({
+                            "title": j.get('title'), "company": j.get('company_name'),
+                            "location": loc or "Remote / Global", "url": j.get('url'),
+                            "tags": j.get('category', ''), "source": "Remotive",
+                            "date": j.get('publication_date')
+                        })
+                        added += 1
+            logger.info(f"✅ Remotive completed. {added} jobs added.")
+        except Exception as e:
+            logger.error(f"❌ Remotive failed: {e}")
+
+    def scrape_jobicy(self):
+        logger.info("🌐 Scraping Jobicy Aggregator (Filtering for India)...")
+        added = 0
+        try:
+            res = requests.get("https://jobicy.com/api/v2/remote-jobs", headers=self.headers, timeout=15)
+            data = res.json().get('jobs', [])
+            for j in data:
+                if self.filter_job(j.get('title', '')):
+                    loc = (j.get('location') or "Remote").strip() or "Remote"
+                    # "Remote" with no further qualifier is conventionally open to any country,
+                    # including India — don't exclude it just because it doesn't say "worldwide".
+                    is_open_remote = loc.lower() in ("remote", "") or "worldwide" in loc.lower() or "anywhere" in loc.lower()
+                    if self.is_india_job(loc) or is_open_remote:
+                        self.jobs.append({
+                            "title": j.get('title'), "company": j.get('company'),
+                            "location": loc, "url": j.get('url'),
+                            "tags": "Aggregated", "source": "Jobicy", "date": j.get('created_at')
+                        })
+                        added += 1
+            logger.info(f"✅ Jobicy completed. {added} jobs added.")
+        except Exception as e:
+            logger.error(f"❌ Jobicy failed: {e}")
+
+    def scrape_arbeitnow(self):
+        logger.info("🌐 Scraping Arbeitnow (Filtering for India)...")
+        added = 0
+        try:
+            res = requests.get("https://www.arbeitnow.com/api/job-board-api", headers=self.headers, timeout=15)
+            data = res.json().get('data', [])
+            for j in data:
+                if self.filter_job(j.get('title', '')):
+                    loc = j.get('location', 'Remote') or "Remote"
+                    is_remote = j.get('remote', False)
+                    if self.is_india_job(loc) or is_remote:
+                        self.jobs.append({
+                            "title": j.get('title'),
+                            "company": j.get('company', {}).get('name', 'Unknown') if isinstance(j.get('company'), dict) else j.get('company_name', 'Unknown'),
+                            "location": loc, "url": j.get('url'),
+                            "tags": "Tech", "source": "Arbeitnow", "date": j.get('created_at')
+                        })
+                        added += 1
+            logger.info(f"✅ Arbeitnow completed. {added} jobs added.")
+        except Exception as e:
+            logger.error(f"❌ Arbeitnow failed: {e}")
+
+    def scrape_weworkremotely(self):
+        logger.info("🌐 Scraping WeWorkRemotely...")
+        added = 0
+        try:
+            res = requests.get("https://weworkremotely.com/categories/remote-dev-jobs.rss", headers=self.headers, timeout=15)
+            soup = BeautifulSoup(res.content, "xml")
+            for item in soup.find_all("item"):
+                title = item.find("title").text
+                if self.filter_job(title):
+                    self.jobs.append({
+                        "title": title, "company": "Various",
+                        "location": "Remote (Worldwide)", "url": item.find("link").text,
+                        "tags": "WWR", "source": "WeWorkRemotely", "date": item.find("pubDate").text
+                    })
+                    added += 1
+            logger.info(f"✅ WeWorkRemotely completed. {added} jobs added.")
+        except Exception as e:
+            logger.error(f"❌ WWR failed: {e}")
+
+    # ------------------------------------------------------------------
+    # SOURCE 10: JobSavior — Pune-specific listing page (best-effort HTML)
+    # No public API. Server-rendered HTML, so static scraping CAN reach
+    # it (unlike Naukri/Internshala), but markup/classes may shift over
+    # time. Multiple selector fallbacks are tried before giving up.
+    # ------------------------------------------------------------------
+    def scrape_jobsavior_pune(self):
+        logger.info("📍 Scraping JobSavior (Pune)...")
+        added = 0
+
+        # JobSavior supports targeted query URLs:
+        #   https://in.jobsavior.com/job-offers/pune/query-<role-slug>
+        # This is far more reliable than scraping the unfiltered firehose
+        # page (which is dominated by non-tech roles) and guessing at CSS
+        # class names that can change without notice.
+        query_slugs = [
+            "software-engineer", "software-developer", "data-analyst",
+            "data-engineer", "java-developer", "python-developer",
+            "backend-developer", "frontend-developer", "full-stack-developer",
+        ]
+
+        for slug in query_slugs:
+            try:
+                url = f"https://in.jobsavior.com/job-offers/pune/query-{slug}"
+                res = requests.get(url, headers=self.headers, timeout=15)
+                if res.status_code != 200:
+                    logger.warning(f"   JobSavior query '{slug}' returned HTTP {res.status_code}, skipping.")
+                    continue
+                soup = BeautifulSoup(res.text, "html.parser")
+
+                # Try several plausible card containers; fall back to scanning
+                # all anchor tags whose href looks like a job-detail link if
+                # none of the structured containers are found.
+                cards = (soup.find_all("div", class_="job-item")
+                          or soup.find_all("article")
+                          or soup.find_all("div", class_="card")
+                          or soup.find_all("div", class_=lambda c: c and "job" in c.lower()))
+
+                if not cards:
+                    logger.warning(f"   JobSavior query '{slug}': no recognizable job cards found "
+                                    "(site markup may have changed). 0 jobs added for this query.")
+                    continue
+
+                slug_added = 0
+                for card in cards:
+                    title_elem = card.find(["h2", "h3", "a"])
+                    if not title_elem:
+                        continue
+                    title = title_elem.get_text(strip=True)
+                    snippet = card.get_text(" ", strip=True)
+
+                    if not self.filter_job(title):
+                        continue
+                    entry_check = is_entry_level(title, snippet)
+                    if entry_check is False:
+                        continue  # explicitly senior — skip
+
+                    link_elem = card.find("a")
+                    href = link_elem.get("href", "") if link_elem else ""
+                    if href and not href.startswith("http"):
+                        href = "https://in.jobsavior.com" + href
+
+                    company_elem = card.find(["span", "div"], class_=lambda c: c and "company" in c.lower())
+
+                    self.jobs.append({
+                        "title": title,
+                        "company": company_elem.get_text(strip=True) if company_elem else "Unknown",
+                        "location": "Pune, India",
+                        "url": href,
+                        "tags": "Pune / Entry-Level" if entry_check else "Pune",
+                        "source": "JobSavior",
+                        "date": "Recent",
+                    })
+                    added += 1
+                    slug_added += 1
+                logger.info(f"   ✓ JobSavior '{slug}': {len(cards)} cards scanned, {slug_added} matched filters.")
+            except Exception as e:
+                logger.warning(f"   JobSavior query '{slug}' failed: {e}")
+
+        logger.info(f"✅ JobSavior completed. {added} Pune jobs added.")
+
+    # ------------------------------------------------------------------
+    # SOURCE 11: Jobsora — Pune-specific listing page (best-effort HTML)
+    # ------------------------------------------------------------------
+    def scrape_jobsora_pune(self):
+        logger.info("📍 Scraping Jobsora (Pune)...")
+        added = 0
+        try:
+            url = "https://in.jobsora.com/jobs-pune"
+            res = requests.get(url, headers=self.headers, timeout=15)
+            if res.status_code != 200:
+                logger.warning(f"   Jobsora returned HTTP {res.status_code}, skipping.")
+                return
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            cards = (soup.find_all("div", class_="vacancy-item")
+                      or soup.find_all("article")
+                      or soup.find_all("div", class_="job-card"))
+
+            if not cards:
+                logger.warning("   Jobsora: no recognizable job cards found "
+                                "(site markup may have changed). 0 jobs added.")
+                return
+
+            for card in cards:
+                title_elem = card.find(["h2", "h3", "a"])
+                if not title_elem:
+                    continue
+                title = title_elem.get_text(strip=True)
+                snippet = card.get_text(" ", strip=True)
+
+                if not self.filter_job(title):
+                    continue
+                entry_check = is_entry_level(title, snippet)
+                if entry_check is False:
+                    continue
+
+                link_elem = card.find("a")
+                href = link_elem.get("href", "") if link_elem else ""
+                if href and not href.startswith("http"):
+                    href = "https://in.jobsora.com" + href
+
+                company_elem = card.find(["span", "div"], class_=lambda c: c and "company" in c.lower())
+
+                self.jobs.append({
                     "title": title,
-                    "company": item.get("company_name", "Unknown"),
-                    "location": item.get("candidate_required_location", "Remote"),
-                    "url": item.get("url", ""),
-                    "tags": ", ".join(item.get("tags", [])[:5]),
-                    "source": "Remotive",
-                    "date": item.get("publication_date", "")[:10],
+                    "company": company_elem.get_text(strip=True) if company_elem else "Unknown",
+                    "location": "Pune, India",
+                    "url": href,
+                    "tags": "Pune / Entry-Level" if entry_check else "Pune",
+                    "source": "Jobsora",
+                    "date": "Recent",
                 })
-            if len(jobs) >= 15:
-                break
-    except Exception as e:
-        logger.error(f"Remotive scrape failed: {e}")
-    logger.info(f"Remotive: {len(jobs)} jobs")
-    return jobs
-
-
-# ── Source 3: We Work Remotely ───────────────────────────────────────────────
-def scrape_weworkremotely() -> list[dict]:
-    jobs = []
-    categories = [
-        "https://weworkremotely.com/categories/remote-programming-jobs.rss",
-        "https://weworkremotely.com/categories/remote-back-end-programming-jobs.rss",
-        "https://weworkremotely.com/categories/remote-front-end-programming-jobs.rss",
-    ]
-    try:
-        for feed_url in categories:
-            resp = _safe_get(feed_url)
-            if not resp:
-                continue
-            soup = BeautifulSoup(resp.text, "xml")
-            for item in soup.find_all("item")[:10]:
-                title_tag = item.find("title")
-                link_tag = item.find("link")
-                region_tag = item.find("region")
-                company_tag = item.find("company")
-                if not title_tag:
-                    continue
-                title = title_tag.text.strip()
-                # WWR titles are "Company: Role"
-                if ":" in title:
-                    parts = title.split(":", 1)
-                    company = parts[0].strip()
-                    role = parts[1].strip()
-                else:
-                    company = company_tag.text if company_tag else "Unknown"
-                    role = title
-                if not _is_relevant(role):
-                    continue
-                url = link_tag.text.strip() if link_tag else ""
-                jobs.append({
-                    "title": role,
-                    "company": company,
-                    "location": region_tag.text if region_tag else "Remote",
-                    "url": url,
-                    "tags": "",
-                    "source": "WeWorkRemotely",
-                    "date": "",
-                })
-            if len(jobs) >= 15:
-                break
-    except Exception as e:
-        logger.error(f"WeWorkRemotely scrape failed: {e}")
-    logger.info(f"WeWorkRemotely: {len(jobs)} jobs")
-    return jobs
-
-
-# ── Source 4: GitHub Jobs via Jobicy API ─────────────────────────────────────
-def scrape_jobicy() -> list[dict]:
-    jobs = []
-    try:
-        url = "https://jobicy.com/api/v2/remote-jobs?count=20&tag=developer"
-        resp = _safe_get(url)
-        if not resp:
-            return jobs
-        data = resp.json()
-        for item in data.get("jobs", []):
-            title = item.get("jobTitle", "")
-            if not _is_relevant(title):
-                continue
-            jobs.append({
-                "title": title,
-                "company": item.get("companyName", "Unknown"),
-                "location": item.get("jobGeo", "Remote"),
-                "url": item.get("url", ""),
-                "tags": ", ".join(item.get("jobIndustry", [])[:3]) if isinstance(item.get("jobIndustry"), list) else "",
-                "source": "Jobicy",
-                "date": item.get("pubDate", "")[:10],
-            })
-            if len(jobs) >= 10:
-                break
-    except Exception as e:
-        logger.error(f"Jobicy scrape failed: {e}")
-    logger.info(f"Jobicy: {len(jobs)} jobs")
-    return jobs
-
-
-# ── Source 5: Arbeitnow (EU + Remote) ────────────────────────────────────────
-def scrape_arbeitnow() -> list[dict]:
-    jobs = []
-    try:
-        resp = _safe_get("https://www.arbeitnow.com/api/job-board-api")
-        if not resp:
-            return jobs
-        data = resp.json()
-        for item in data.get("data", []):
-            title = item.get("title", "")
-            if not _is_relevant(title):
-                continue
-            jobs.append({
-                "title": title,
-                "company": item.get("company_name", "Unknown"),
-                "location": "Remote" if item.get("remote") else item.get("location", "EU"),
-                "url": item.get("url", ""),
-                "tags": ", ".join(item.get("tags", [])[:4]),
-                "source": "Arbeitnow",
-                "date": str(item.get("created_at", ""))[:10],
-            })
-            if len(jobs) >= 10:
-                break
-    except Exception as e:
-        logger.error(f"Arbeitnow scrape failed: {e}")
-    logger.info(f"Arbeitnow: {len(jobs)} jobs")
-    return jobs
-
-
-# ── Main collector ────────────────────────────────────────────────────────────
-def collect_jobs(min_jobs: int = 10) -> list[dict]:
-    """
-    Collect jobs from all sources, deduplicate, and return at least min_jobs.
-    """
-    all_jobs: list[dict] = []
-    scrapers = [
-        scrape_remoteok,
-        scrape_remotive,
-        scrape_weworkremotely,
-        scrape_jobicy,
-        scrape_arbeitnow,
-    ]
-    for scraper in scrapers:
-        try:
-            results = scraper()
-            all_jobs.extend(results)
+                added += 1
+            logger.info(f"✅ Jobsora completed. {added} Pune jobs added.")
         except Exception as e:
-            logger.error(f"Scraper {scraper.__name__} crashed: {e}")
+            logger.warning(f"   Jobsora scraping failed: {e}")
 
-    # Deduplicate by URL
-    seen_urls = set()
-    unique_jobs = []
-    for job in all_jobs:
-        url = job.get("url", "")
-        if url and url not in seen_urls:
-            seen_urls.add(url)
-            unique_jobs.append(job)
+    # ------------------------------------------------------------------
+    # SOURCE 12: Naukri Fresher Jobs in Pune (BEST-EFFORT — no public API)
+    # Naukri renders job listings via client-side JavaScript, so a plain
+    # HTTP GET will not contain the job cards in most cases. This is kept
+    # as a best-effort source consistent with scrape_naukri() above: if
+    # it returns 0, that is expected, not a bug.
+    # ------------------------------------------------------------------
+    def scrape_naukri_fresher_pune(self):
+        logger.info("📍 Scraping Naukri Fresher Jobs (Pune, best-effort)...")
+        added = 0
+        try:
+            url = "https://www.naukri.com/fresher-jobs-in-pune"
+            res = requests.get(url, headers=self.headers, timeout=15)
+            if res.status_code != 200:
+                logger.warning(f"   Naukri fresher-Pune returned HTTP {res.status_code} (likely blocked). Skipping.")
+                return
+            soup = BeautifulSoup(res.text, "html.parser")
+            cards = soup.find_all("article", class_="jobTuple") or soup.find_all("div", class_="srp-jobtuple-wrapper")
 
-    logger.info(f"Total unique jobs collected: {len(unique_jobs)}")
+            if not cards:
+                logger.warning("   Naukri fresher-Pune: no job cards found in static HTML "
+                                "(page renders via JavaScript — static scraping can't reach it, as expected).")
+                return
 
-    if len(unique_jobs) < min_jobs:
-        logger.warning(
-            f"Only {len(unique_jobs)} jobs found, below minimum of {min_jobs}. "
-            "Sending what we have."
-        )
+            for card in cards:
+                title_elem = card.find("a", class_="title")
+                company_elem = card.find("a", class_="comp-name")
+                if not title_elem:
+                    continue
+                title = title_elem.text.strip()
+                if not self.filter_job(title):
+                    continue
+                self.jobs.append({
+                    "title": title,
+                    "company": company_elem.text.strip() if company_elem else "Unknown",
+                    "location": "Pune, India",
+                    "url": title_elem.get("href", ""),
+                    "tags": "Pune / Fresher",
+                    "source": "Naukri-Fresher-Pune",
+                    "date": "Recent",
+                })
+                added += 1
+            logger.info(f"✅ Naukri fresher-Pune completed. {added} jobs added.")
+        except Exception as e:
+            logger.warning(f"   Naukri fresher-Pune scraping failed: {e}")
 
-    return unique_jobs
+    # ------------------------------------------------------------------
+    # SOURCE 13: Apna.co — Pune listing page (best-effort HTML)
+    # Apna is server-rendered (confirmed reachable) but is a general
+    # blue-collar + white-collar jobs board, so the role filter does
+    # most of the work here to surface only SDE/data/analyst postings.
+    # ------------------------------------------------------------------
+    def scrape_apna_pune(self):
+        logger.info("📍 Scraping Apna.co (Pune)...")
+        added = 0
+
+        # Apna's city page is dominated by blue-collar/gig roles (delivery,
+        # sales, drivers) on page 1 — tech roles are sparse and often appear
+        # further into the listing. We page through a few pages instead of
+        # only checking page 1, which previously returned 0 tech matches.
+        MAX_PAGES = 5
+
+        for page in range(1, MAX_PAGES + 1):
+            try:
+                url = "https://apna.co/jobs/jobs-in-pune" if page == 1 else f"https://apna.co/jobs/jobs-in-pune?page={page}"
+                res = requests.get(url, headers=self.headers, timeout=15)
+                if res.status_code != 200:
+                    logger.warning(f"   Apna.co page {page} returned HTTP {res.status_code}, stopping pagination.")
+                    break
+                soup = BeautifulSoup(res.text, "html.parser")
+
+                # Apna job cards are anchor tags linking to /job/pune/<slug>-<id>
+                links = soup.find_all("a", href=lambda h: h and "/job/pune/" in h)
+
+                if not links:
+                    logger.warning(f"   Apna.co page {page}: no job links found "
+                                    "(site markup may have changed or pagination ended).")
+                    break
+
+                page_added = 0
+                for link in links:
+                    href = link.get("href", "")
+                    # The title is the slug segment of the URL (e.g.
+                    # /job/pune/data-analyst-fresher-333 -> "data analyst fresher"),
+                    # which is far more reliable than the link's visible text —
+                    # Apna concatenates title+company+location+salary into one
+                    # text blob with no separators (e.g. "Delivery
+                    # AssociateGigpreneur StaffingPune..."), making it
+                    # impossible to cleanly extract just the role title from
+                    # visible text alone.
+                    slug = href.rstrip('/').split('/')[-1]
+                    # Strip the trailing numeric job-id suffix, e.g. "...-558932930"
+                    slug = re.sub(r'-\d+$', '', slug)
+                    title = slug.replace('-', ' ').strip().title()
+
+                    if not title:
+                        continue
+                    if not self.filter_job(title):
+                        continue
+                    entry_check = is_entry_level(title)
+                    if entry_check is False:
+                        continue
+
+                    full_href = href if href.startswith("http") else "https://apna.co" + href
+
+                    self.jobs.append({
+                        "title": title,
+                        "company": "See listing",
+                        "location": "Pune, India",
+                        "url": full_href,
+                        "tags": "Pune / Entry-Level" if entry_check else "Pune",
+                        "source": "Apna",
+                        "date": "Recent",
+                    })
+                    added += 1
+                    page_added += 1
+                logger.info(f"   ✓ Apna.co page {page}: {len(links)} listings scanned, {page_added} matched filters.")
+            except Exception as e:
+                logger.warning(f"   Apna.co page {page} failed: {e}")
+                break
+
+        logger.info(f"✅ Apna.co completed. {added} Pune jobs added.")
+
+    def run_all(self):
+        logger.info("🚀 Starting India-Focused scraping process...")
+
+        # India-specific / India-reliable sources first
+        self.scrape_greenhouse()
+        self.scrape_lever()
+        self.scrape_internshala()
+        self.scrape_naukri()
+
+        # Pune-specific sources (new)
+        self.scrape_jobsavior_pune()
+        self.scrape_jobsora_pune()
+        self.scrape_naukri_fresher_pune()
+        self.scrape_apna_pune()
+
+        # Global boards, hard-filtered for India relevance
+        self.scrape_remoteok()
+        self.scrape_remotive()
+        self.scrape_jobicy()
+        self.scrape_arbeitnow()
+        self.scrape_weworkremotely()
+
+        # ------------------------------------------------------------
+        # ENTRY-LEVEL FILTER (0-2 years experience) — applied globally
+        # across every source, not just the Pune-specific ones. We only
+        # DROP a job when the title/snippet explicitly signals senior
+        # experience (e.g. "Senior", "5+ years", "Lead"). Jobs with no
+        # explicit experience signal either way are KEPT, since most
+        # genuine SDE-I / Analyst / Intern postings don't always spell
+        # out "0-2 years" in the title — being strict in the other
+        # direction would wipe out most of the real entry-level supply.
+        # ------------------------------------------------------------
+        filtered_jobs = []
+        senior_dropped = 0
+        for j in self.jobs:
+            check = is_entry_level(j.get('title', ''), j.get('tags', ''))
+            if check is False:
+                senior_dropped += 1
+                continue
+            filtered_jobs.append(j)
+        logger.info(f"   🎯 Entry-level filter: dropped {senior_dropped} senior/experienced postings, "
+                    f"kept {len(filtered_jobs)} entry-level or unspecified-experience jobs.")
+        self.jobs = filtered_jobs
+
+        # ------------------------------------------------------------
+        # DEDUPLICATION — strengthened.
+        # Primary key: URL (most reliable when present and not a generic
+        # listing-page URL). Fallback key: normalized (title + company),
+        # because some scraped sources (e.g. WeWorkRemotely "Various",
+        # or a card with no href) can produce blank/duplicate URLs while
+        # still being genuinely different postings, or genuinely the same
+        # posting mirrored across two sources. Both keys must be unseen
+        # for a job to be kept.
+        # ------------------------------------------------------------
+        seen_urls = set()
+        seen_title_company = set()
+        unique_jobs = []
+        for j in self.jobs:
+            url = (j.get('url') or '').strip().rstrip('/')
+            title_key = (j.get('title') or '').strip().lower()
+            company_key = (j.get('company') or '').strip().lower()
+            combo_key = f"{title_key}::{company_key}"
+
+            if url:
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+            # Even with a unique/blank URL, also guard against the same
+            # title+company appearing twice across different sources.
+            if combo_key in seen_title_company and title_key and company_key:
+                continue
+            seen_title_company.add(combo_key)
+            unique_jobs.append(j)
+
+        # Surface Pune jobs first, since that's this run's priority,
+        # without dropping non-Pune jobs from the digest.
+        unique_jobs.sort(key=lambda j: 0 if self.is_pune_job(j.get('location', '')) else 1)
+
+        logger.info(f"✨ Successfully collected {len(unique_jobs)} unique jobs.")
+
+        pune_count = sum(1 for j in unique_jobs if self.is_pune_job(j.get('location', '')))
+        logger.info(f"   📍 Of which Pune-located: {pune_count}")
+
+        # Source breakdown for visibility
+        from collections import Counter
+        counts = Counter(j['source'] for j in unique_jobs)
+        for src, count in counts.items():
+            logger.info(f"   📊 {src}: {count} jobs")
+
+        return unique_jobs

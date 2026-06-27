@@ -1,0 +1,55 @@
+name: Daily Job Email Digest
+
+# This file MUST live at the REPOSITORY ROOT under .github/workflows/ —
+# GitHub only scans that exact path. Since the project was flattened
+# (no more new-ai-job/ subfolder), this workflow runs directly from the
+# repo root with no working-directory override needed.
+
+on:
+  # Runs automatically every day at 03:30 UTC = 09:00 AM IST.
+  # GitHub Actions schedules always run in UTC. To change the send time,
+  # compute the UTC equivalent of your target IST time (IST = UTC+5:30)
+  # or use https://crontab.guru to build the cron expression.
+  schedule:
+    - cron: '30 3 * * *'
+
+  # Adds a "Run workflow" button on the GitHub Actions tab so you can
+  # trigger a run manually for testing, without waiting for 9 AM.
+  workflow_dispatch:
+
+jobs:
+  send-job-digest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15   # safety cap so a hung run doesn't burn time indefinitely
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run job email agent
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_APP_PASSWORD: ${{ secrets.SENDER_APP_PASSWORD }}
+          RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
+          MIN_JOBS: ${{ secrets.MIN_JOBS }}
+        run: python main.py --now
+
+      - name: Upload run log (for debugging failed runs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-log
+          path: logs/agent.log
+          retention-days: 7
+          if-no-files-found: ignore
