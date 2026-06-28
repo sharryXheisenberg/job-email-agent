@@ -430,88 +430,16 @@ class JobScraper:
             logger.error(f"❌ WWR failed: {e}")
 
     # ------------------------------------------------------------------
-    # SOURCE 10: JobSavior — Pune-specific listing page (best-effort HTML)
-    # No public API. Server-rendered HTML, so static scraping CAN reach
-    # it (unlike Naukri/Internshala), but markup/classes may shift over
-    # time. Multiple selector fallbacks are tried before giving up.
+    # NOTE: JobSavior was removed as a source. It was tried with both a
+    # firehose-page scrape and (later) 9 separate targeted role-query
+    # URLs, and returned 0 matching jobs both times — the site's actual
+    # markup never matched any of the plausible selectors tried. Rather
+    # than keep dead code, it's removed; foundit.in below covers the
+    # same Pune + role-targeted use case far more reliably.
     # ------------------------------------------------------------------
-    def scrape_jobsavior_pune(self):
-        logger.info("📍 Scraping JobSavior (Pune)...")
-        added = 0
-
-        # JobSavior supports targeted query URLs:
-        #   https://in.jobsavior.com/job-offers/pune/query-<role-slug>
-        # This is far more reliable than scraping the unfiltered firehose
-        # page (which is dominated by non-tech roles) and guessing at CSS
-        # class names that can change without notice.
-        query_slugs = [
-            "software-engineer", "software-developer", "data-analyst",
-            "data-engineer", "java-developer", "python-developer",
-            "backend-developer", "frontend-developer", "full-stack-developer",
-        ]
-
-        for slug in query_slugs:
-            try:
-                url = f"https://in.jobsavior.com/job-offers/pune/query-{slug}"
-                res = requests.get(url, headers=self.headers, timeout=15)
-                if res.status_code != 200:
-                    logger.warning(f"   JobSavior query '{slug}' returned HTTP {res.status_code}, skipping.")
-                    continue
-                soup = BeautifulSoup(res.text, "html.parser")
-
-                # Try several plausible card containers; fall back to scanning
-                # all anchor tags whose href looks like a job-detail link if
-                # none of the structured containers are found.
-                cards = (soup.find_all("div", class_="job-item")
-                          or soup.find_all("article")
-                          or soup.find_all("div", class_="card")
-                          or soup.find_all("div", class_=lambda c: c and "job" in c.lower()))
-
-                if not cards:
-                    logger.warning(f"   JobSavior query '{slug}': no recognizable job cards found "
-                                    "(site markup may have changed). 0 jobs added for this query.")
-                    continue
-
-                slug_added = 0
-                for card in cards:
-                    title_elem = card.find(["h2", "h3", "a"])
-                    if not title_elem:
-                        continue
-                    title = title_elem.get_text(strip=True)
-                    snippet = card.get_text(" ", strip=True)
-
-                    if not self.filter_job(title):
-                        continue
-                    entry_check = is_entry_level(title, snippet)
-                    if entry_check is False:
-                        continue  # explicitly senior — skip
-
-                    link_elem = card.find("a")
-                    href = link_elem.get("href", "") if link_elem else ""
-                    if href and not href.startswith("http"):
-                        href = "https://in.jobsavior.com" + href
-
-                    company_elem = card.find(["span", "div"], class_=lambda c: c and "company" in c.lower())
-
-                    self.jobs.append({
-                        "title": title,
-                        "company": company_elem.get_text(strip=True) if company_elem else "Unknown",
-                        "location": "Pune, India",
-                        "url": href,
-                        "tags": "Pune / Entry-Level" if entry_check else "Pune",
-                        "source": "JobSavior",
-                        "date": "Recent",
-                    })
-                    added += 1
-                    slug_added += 1
-                logger.info(f"   ✓ JobSavior '{slug}': {len(cards)} cards scanned, {slug_added} matched filters.")
-            except Exception as e:
-                logger.warning(f"   JobSavior query '{slug}' failed: {e}")
-
-        logger.info(f"✅ JobSavior completed. {added} Pune jobs added.")
 
     # ------------------------------------------------------------------
-    # SOURCE 11: Jobsora — Pune-specific listing page (best-effort HTML)
+    # SOURCE 10: Jobsora — Pune-specific listing page (best-effort HTML)
     # ------------------------------------------------------------------
     def scrape_jobsora_pune(self):
         logger.info("📍 Scraping Jobsora (Pune)...")
@@ -690,6 +618,255 @@ class JobScraper:
 
         logger.info(f"✅ Apna.co completed. {added} Pune jobs added.")
 
+    # ------------------------------------------------------------------
+    # SOURCE: foundit.in (formerly Monster India) — Pune + role targeted
+    # Confirmed server-rendered with a predictable URL pattern:
+    #   https://www.foundit.in/search/<role-slug>-jobs-in-pune
+    # Job cards are simple markdown-style headings with title, company,
+    # experience range (e.g. "1-3 yrs"), and location all in plain text
+    # right next to each other — no JS rendering needed. This is the
+    # most reliable Pune-specific source added so far.
+    # ------------------------------------------------------------------
+    def scrape_foundit_pune(self):
+        logger.info("📍 Scraping foundit.in (Pune)...")
+        added = 0
+
+        role_slugs = [
+            "software-engineer", "software-developer", "data-analyst",
+            "data-engineer", "java-developer", "python-developer",
+            "backend-developer", "frontend-developer", "full-stack-developer",
+            "qa-engineer",
+        ]
+
+        for slug in role_slugs:
+            try:
+                url = f"https://www.foundit.in/search/{slug}-jobs-in-pune"
+                res = requests.get(url, headers=self.headers, timeout=15)
+                if res.status_code != 200:
+                    logger.warning(f"   foundit.in '{slug}' returned HTTP {res.status_code}, skipping.")
+                    continue
+                soup = BeautifulSoup(res.text, "html.parser")
+
+                # Each job posting is an <h2> (or <h3>) heading containing the
+                # job title, linked to the detail page. Experience and location
+                # text live in nearby sibling elements within the same card
+                # container, so we walk up to a reasonable parent and read its
+                # full text for entry-level/senior signal detection.
+                heading_links = soup.find_all("a", href=lambda h: h and "/job/" in h)
+
+                if not heading_links:
+                    logger.warning(f"   foundit.in '{slug}': no job links found "
+                                    "(site markup may have changed). 0 jobs added.")
+                    continue
+
+                slug_added = 0
+                seen_on_page = set()
+                for link in heading_links:
+                    title = link.get_text(strip=True)
+                    href = link.get("href", "")
+                    if not title or href in seen_on_page:
+                        continue
+                    seen_on_page.add(href)
+
+                    if not self.filter_job(title):
+                        continue
+
+                    # Walk up to the nearest container that also holds the
+                    # experience/location text (foundit nests title inside a
+                    # heading inside a card div), so entry-level/senior
+                    # detection sees more than just the bare title.
+                    container = link.find_parent(["div", "article"]) or link.parent
+                    snippet = container.get_text(" ", strip=True) if container else title
+
+                    entry_check = is_entry_level(title, snippet)
+                    if entry_check is False:
+                        continue  # explicitly senior — skip
+
+                    full_href = href if href.startswith("http") else "https://www.foundit.in" + href
+
+                    # foundit shows company name as the very next sibling text
+                    # after the title heading in practice; fall back to
+                    # "Unknown" if that structure isn't found.
+                    company_elem = container.find(["span", "div"]) if container else None
+                    company = company_elem.get_text(strip=True) if company_elem and company_elem.get_text(strip=True) != title else "Unknown"
+
+                    self.jobs.append({
+                        "title": title,
+                        "company": company,
+                        "location": "Pune, India",
+                        "url": full_href,
+                        "tags": "Pune / Entry-Level" if entry_check else "Pune",
+                        "source": "foundit",
+                        "date": "Recent",
+                    })
+                    added += 1
+                    slug_added += 1
+                logger.info(f"   ✓ foundit.in '{slug}': {len(heading_links)} links scanned, {slug_added} matched filters.")
+            except Exception as e:
+                logger.warning(f"   foundit.in '{slug}' failed: {e}")
+
+        logger.info(f"✅ foundit.in completed. {added} Pune jobs added.")
+
+    # ------------------------------------------------------------------
+    # SOURCE: KN Academy Off-Campus Jobs — confirmed server-rendered
+    # WordPress blog listing real off-campus hiring drives (TCS, Accenture,
+    # Infosys, etc.), updated multiple times per week. Each posting is a
+    # heading link to its own detail page.
+    # ------------------------------------------------------------------
+    def scrape_knoffcampusjobs(self):
+        logger.info("🇮🇳 Scraping KN Off-Campus Jobs...")
+        added = 0
+        try:
+            res = requests.get("https://knoffcampusjobs.com/", headers=self.headers, timeout=15)
+            if res.status_code != 200:
+                logger.warning(f"   KN Off-Campus Jobs returned HTTP {res.status_code}, skipping.")
+                return
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            # Each posting title is an <h2>/<h3>/<h4> heading (theme-dependent)
+            # containing a single <a> link to the post's own page.
+            headings = soup.find_all(["h2", "h3", "h4", "h5"])
+
+            if not headings:
+                logger.warning("   KN Off-Campus Jobs: no headings found "
+                                "(site markup may have changed). 0 jobs added.")
+                return
+
+            for heading in headings:
+                link = heading.find("a")
+                if not link:
+                    continue
+                title = link.get_text(strip=True)
+                if not title or not self.filter_job(title):
+                    continue
+
+                entry_check = is_entry_level(title)
+                if entry_check is False:
+                    continue
+
+                href = link.get("href", "")
+                location = "India"
+                if self.is_pune_job(title):
+                    location = "Pune, India"
+
+                self.jobs.append({
+                    "title": title,
+                    "company": "See listing",
+                    "location": location,
+                    "url": href,
+                    "tags": "India / Entry-Level" if entry_check else "India",
+                    "source": "KNOffCampus",
+                    "date": "Recent",
+                })
+                added += 1
+            logger.info(f"✅ KN Off-Campus Jobs completed. {added} jobs added.")
+        except Exception as e:
+            logger.warning(f"   KN Off-Campus Jobs scraping failed: {e}")
+
+    # ------------------------------------------------------------------
+    # SOURCE: Job Via Referral — confirmed server-rendered WordPress,
+    # fresher-focused referral postings. Title text is emoji-prefixed
+    # (e.g. "🚀 Microsoft Hiring..."), so the leading emoji/whitespace is
+    # stripped before role-matching to avoid false negatives.
+    # ------------------------------------------------------------------
+    def scrape_jobviareferral(self):
+        logger.info("🇮🇳 Scraping Job Via Referral (Fresher Jobs)...")
+        added = 0
+        try:
+            url = "https://jobviareferral.com/category/fresher-referral-jobs/"
+            res = requests.get(url, headers=self.headers, timeout=15)
+            if res.status_code != 200:
+                logger.warning(f"   Job Via Referral returned HTTP {res.status_code}, skipping.")
+                return
+            soup = BeautifulSoup(res.text, "html.parser")
+
+            headings = soup.find_all(["h1", "h2", "h3"])
+
+            if not headings:
+                logger.warning("   Job Via Referral: no headings found "
+                                "(site markup may have changed). 0 jobs added.")
+                return
+
+            for heading in headings:
+                link = heading.find("a")
+                if not link:
+                    continue
+                raw_title = link.get_text(strip=True)
+                # Strip leading emoji/symbol clutter (e.g. "🚀 ") before matching,
+                # since TARGET_ROLES patterns are plain-text word-boundary checks.
+                title = re.sub(r'^[^\w]+', '', raw_title).strip()
+                if not title or not self.filter_job(title):
+                    continue
+
+                entry_check = is_entry_level(title)
+                if entry_check is False:
+                    continue
+
+                href = link.get("href", "")
+                location = "Pune, India" if self.is_pune_job(title) else "India"
+
+                self.jobs.append({
+                    "title": title,
+                    "company": "See listing",
+                    "location": location,
+                    "url": href,
+                    "tags": "Fresher Referral / Entry-Level" if entry_check else "Fresher Referral",
+                    "source": "JobViaReferral",
+                    "date": "Recent",
+                })
+                added += 1
+            logger.info(f"✅ Job Via Referral completed. {added} jobs added.")
+        except Exception as e:
+            logger.warning(f"   Job Via Referral scraping failed: {e}")
+
+    # ------------------------------------------------------------------
+    # SOURCE: CommonJobs.in — BEST-EFFORT only. Confirmed the job-listing
+    # page renders results via client-side JavaScript ("Showing — jobs",
+    # "Loading…" placeholders in the raw HTML), so a static GET will not
+    # see actual postings in most cases. Kept consistent with the
+    # Naukri/Internshala best-effort pattern: never crashes, just logs
+    # honestly if/when it returns nothing.
+    # ------------------------------------------------------------------
+    def scrape_commonjobs(self):
+        logger.info("🇮🇳 Scraping CommonJobs.in (best-effort, may yield 0 results)...")
+        added = 0
+        try:
+            url = "https://commonjobs.in/jobs/"
+            res = requests.get(url, headers=self.headers, timeout=15)
+            if res.status_code != 200:
+                logger.warning(f"   CommonJobs.in returned HTTP {res.status_code} (likely blocked). Skipping.")
+                return
+            soup = BeautifulSoup(res.text, "html.parser")
+            cards = soup.find_all("a", href=lambda h: h and "/job/" in h)
+
+            if not cards:
+                logger.warning("   CommonJobs.in: no job cards found in static HTML "
+                                "(page renders via JavaScript — static scraping can't reach it, as expected).")
+                return
+
+            for card in cards:
+                title = card.get_text(strip=True)
+                if not title or not self.filter_job(title):
+                    continue
+                entry_check = is_entry_level(title)
+                if entry_check is False:
+                    continue
+                href = card.get("href", "")
+                location = "Pune, India" if self.is_pune_job(title) else "India"
+                self.jobs.append({
+                    "title": title,
+                    "company": "See listing",
+                    "location": location,
+                    "url": href,
+                    "tags": "India / Entry-Level" if entry_check else "India",
+                    "source": "CommonJobs",
+                    "date": "Recent",
+                })
+                added += 1
+            logger.info(f"✅ CommonJobs.in completed. {added} jobs added (best-effort source).")
+        except Exception as e:
+            logger.warning(f"   CommonJobs.in scraping failed: {e}")
+
     def run_all(self):
         logger.info("🚀 Starting India-Focused scraping process...")
 
@@ -698,9 +875,12 @@ class JobScraper:
         self.scrape_lever()
         self.scrape_internshala()
         self.scrape_naukri()
+        self.scrape_knoffcampusjobs()
+        self.scrape_jobviareferral()
+        self.scrape_commonjobs()
 
-        # Pune-specific sources (new)
-        self.scrape_jobsavior_pune()
+        # Pune-specific sources
+        self.scrape_foundit_pune()
         self.scrape_jobsora_pune()
         self.scrape_naukri_fresher_pune()
         self.scrape_apna_pune()
